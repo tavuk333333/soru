@@ -278,6 +278,8 @@ static void MacroLoop() {
         std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
         const Settings& s = *sp;
 
+        bool activeThisIteration = false;   // R-spam firing or a burst in progress — go full speed
+
         if (s.cycleKeyName != prevCycleKeyName) {
             prevCycleKeyName = s.cycleKeyName;
             cycleVK = KeyNameToVK(s.cycleKeyName);
@@ -295,9 +297,9 @@ static void MacroLoop() {
 
             bool rHeld = KeyPhysicallyDown('R');
 
-            if (rHeld && s.rSpamEnabled) {
-                SendCharDownUp('R');
-            }
+            // R-spam moved back to AHK (new.ahk's RSpamLoop) — the engine
+            // no longer sends R itself, it only watches R to drive the
+            // pixel-watch/burst state machine below.
 
             if (!s.keyGroups.empty()) {
                 ULONGLONG now = GetTickCount64();
@@ -322,6 +324,7 @@ static void MacroLoop() {
                     case MacroState::BURST:
                         PressKeyGroup(burstGroup);
                         burstCount++;
+                        activeThisIteration = true;   // finish the burst quickly instead of trickling out at 1ms/press
                         if (burstCount >= s.burstSize) {
                             state = MacroState::COOLDOWN;
                             cooldownEndMs = now + (ULONGLONG)(s.cooldownSeconds * 1000.0);
@@ -334,7 +337,12 @@ static void MacroLoop() {
 #if BUSY_SPIN
         // intentionally no sleep — see the #define above
 #else
-        Sleep(1);   // real sleep — actually releases the CPU, unlike a QPC spin-wait
+        // Sleep(1) most of the time to keep CPU usage low, but skip it on
+        // iterations where we're actively spamming R or mid-burst — those
+        // are short, latency-sensitive bursts and should run at full speed.
+        // Idle time (not holding R, no burst in progress) still sleeps, so
+        // steady-state CPU usage stays low.
+        if (!activeThisIteration) Sleep(1);
 #endif
     }
 
