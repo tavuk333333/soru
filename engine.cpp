@@ -45,7 +45,7 @@ struct Settings {
     int py = 971;
     DWORD targetColor = 0xFFFFFF;   // RGB order, matches AHK's PixelGetColor default
     int burstSize = 5;
-    double cooldownSeconds = 15.2;
+    double cooldownSeconds = 15.01;
     bool rSpamEnabled = false;
     bool suspended = false;
     std::string cycleKeyName = "g";
