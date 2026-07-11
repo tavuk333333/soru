@@ -44,10 +44,18 @@ picks up the update on its own.
 
 ## CPU usage note
 
-The hot loop in `engine.cpp` busy-spins with no sleep at all by
-default (`#define BUSY_SPIN 1`), for the lowest possible latency. This
-pins close to one full CPU core the entire time the engine runs. If
-you'd rather trade a bit of latency for lower CPU usage, change that
-to `#define BUSY_SPIN 0` — it'll pace itself to roughly 1ms per
-iteration instead using the same precise QueryPerformanceCounter wait
-the old AHK version used.
+Settings are shared with the hot loop via a lock-free atomic pointer
+swap, so the loop never copies the config (vector/string) on each
+iteration — that copy was the actual bottleneck in earlier versions,
+not GetPixel or SendInput.
+
+By default (`#define BUSY_SPIN 0`) the hot loop paces itself to
+roughly 1ms per iteration using a real `Sleep(1)`, which actually
+yields the CPU back to Windows between checks. That's still up to
+~1000 pixel-checks/sec and ~500-1000 R-presses/sec — far faster than
+either needs to be — at a small fraction of the CPU cost of a busy
+spin.
+
+If you want the absolute lowest possible latency and don't mind
+pinning close to one full CPU core the entire time the engine runs,
+change that to `#define BUSY_SPIN 1`.
