@@ -26,6 +26,7 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <chrono>
 #include <cctype>
@@ -51,8 +52,14 @@ struct Settings {
     std::vector<std::string> keyGroups;
 };
 
-static std::mutex g_settingsMutex;
-static Settings g_settings;
+// The hot loop used to lock a mutex and copy the whole Settings struct
+// (including a vector<string> and a string) on EVERY iteration. In a
+// busy-spin loop that's potentially millions of heap allocations per
+// second — that was the real bottleneck, not GetPixel/SendInput.
+// Now: ConfigWatcherThread builds a brand-new Settings object and
+// atomically swaps the pointer; MacroLoop just grabs the current
+// pointer (a cheap atomic refcount op, no copy, no allocation).
+static std::shared_ptr<const Settings> g_settings = std::make_shared<Settings>();
 static std::atomic<bool> g_running{true};
 
 // ══════════════════════════════════════════════════════════════
@@ -188,25 +195,24 @@ static std::vector<std::string> SplitGroups(const std::string& text) {
 static void LoadConfig() {
     char buf[512];
 
-    Settings s;
-    {
-        std::lock_guard<std::mutex> lock(g_settingsMutex);
-        s = g_settings;   // start from current values so anything not present stays the same
-    }
+    // Start from the currently-published settings so anything not present
+    // in the file keeps its existing value. This only runs ~5x/sec on the
+    // low-priority watcher thread, so a copy here is totally fine — it's
+    // the HOT LOOP that must never do this.
+    auto s = std::make_shared<Settings>(*std::atomic_load(&g_settings));
 
-    s.px = GetPrivateProfileIntA("Macros", "PixelX", s.px, g_configPath.c_str());
-    s.py = GetPrivateProfileIntA("Macros", "PixelY", s.py, g_configPath.c_str());
-    s.rSpamEnabled = GetPrivateProfileIntA("Macros", "RSpamEnabled", s.rSpamEnabled ? 1 : 0, g_configPath.c_str()) != 0;
-    s.suspended = GetPrivateProfileIntA("State", "Suspended", s.suspended ? 1 : 0, g_configPath.c_str()) != 0;
+    s->px = GetPrivateProfileIntA("Macros", "PixelX", s->px, g_configPath.c_str());
+    s->py = GetPrivateProfileIntA("Macros", "PixelY", s->py, g_configPath.c_str());
+    s->rSpamEnabled = GetPrivateProfileIntA("Macros", "RSpamEnabled", s->rSpamEnabled ? 1 : 0, g_configPath.c_str()) != 0;
+    s->suspended = GetPrivateProfileIntA("State", "Suspended", s->suspended ? 1 : 0, g_configPath.c_str()) != 0;
 
     GetPrivateProfileStringA("Macros", "MoveKeys", "", buf, sizeof(buf), g_configPath.c_str());
-    s.keyGroups = SplitGroups(buf);
+    s->keyGroups = SplitGroups(buf);
 
-    GetPrivateProfileStringA("Hotkeys", "CycleKey", s.cycleKeyName.c_str(), buf, sizeof(buf), g_configPath.c_str());
-    s.cycleKeyName = buf;
+    GetPrivateProfileStringA("Hotkeys", "CycleKey", s->cycleKeyName.c_str(), buf, sizeof(buf), g_configPath.c_str());
+    s->cycleKeyName = buf;
 
-    std::lock_guard<std::mutex> lock(g_settingsMutex);
-    g_settings = s;
+    std::atomic_store(&g_settings, std::shared_ptr<const Settings>(s));
 }
 
 // Runs on its own thread, ~5x/sec — the ONLY place that touches disk.
@@ -239,11 +245,18 @@ static void ConfigWatcherThread(DWORD mainPID) {
 
 // ══════════════════════════════════════════════════════════════
 //  Hot loop — pixel watch / burst state machine / cycle hotkey.
-//  No sleep at all: this is the "absolute max speed" path, at the
-//  cost of pinning close to one full CPU core. See BUSY_SPIN below
-//  if you'd rather trade a little latency for lower CPU usage.
+//  Settings are read via a lock-free atomic pointer swap (no per-
+//  iteration copying/allocation). Pacing mode is controlled by
+//  BUSY_SPIN below.
 // ══════════════════════════════════════════════════════════════
-#define BUSY_SPIN 1   // 1 = tightest possible loop. 0 = ~1ms-paced loop, easier on CPU.
+// 1 = tightest possible loop, pins ~1 full CPU core, absolute max speed.
+// 0 = paced to ~1ms per iteration using a REAL Sleep(1) (with timeBeginPeriod(1)
+//     already active), so it actually yields the CPU back to Windows between
+//     checks. That's still up to ~1000 pixel-checks/sec and ~500-1000 R-presses/sec —
+//     far faster than needed for either — at a tiny fraction of the CPU cost.
+//     (Previously this mode busy-waited on QueryPerformanceCounter instead of
+//     sleeping, so it never actually reduced CPU usage — that's been fixed below.)
+#define BUSY_SPIN 0
 
 enum class MacroState { IDLE, BURST, COOLDOWN };
 
@@ -260,18 +273,10 @@ static void MacroLoop() {
 
     HDC hdcScreen = GetDC(NULL);
 
-#if !BUSY_SPIN
-    LARGE_INTEGER freq, nextTick;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&nextTick);
-#endif
-
     while (g_running.load(std::memory_order_relaxed)) {
-        Settings s;
-        {
-            std::lock_guard<std::mutex> lock(g_settingsMutex);
-            s = g_settings;
-        }
+        // Cheap: bumps a refcount, does NOT copy the vector/string inside.
+        std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
+        const Settings& s = *sp;
 
         if (s.cycleKeyName != prevCycleKeyName) {
             prevCycleKeyName = s.cycleKeyName;
@@ -329,9 +334,7 @@ static void MacroLoop() {
 #if BUSY_SPIN
         // intentionally no sleep — see the #define above
 #else
-        nextTick.QuadPart += freq.QuadPart / 1000;   // ~1ms cadence
-        LARGE_INTEGER now;
-        do { QueryPerformanceCounter(&now); } while (now.QuadPart < nextTick.QuadPart);
+        Sleep(1);   // real sleep — actually releases the CPU, unlike a QPC spin-wait
 #endif
     }
 
