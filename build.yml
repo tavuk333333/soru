@@ -1,0 +1,49 @@
+name: Build macro engine
+
+# Rebuilds engine.exe on every push that touches engine.cpp, using
+# GitHub's own Windows runner — no local Visual Studio needed.
+# The compiled exe is committed straight to dist/engine.exe, along
+# with dist/version.txt (the commit SHA), so the AHK script can pull
+# both directly from raw.githubusercontent.com.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "engine.cpp"
+      - ".github/workflows/build.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile engine.exe
+        shell: cmd
+        run: |
+          mkdir dist
+          cl /O2 /EHsc /nologo engine.cpp ^
+             /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup ^
+             user32.lib gdi32.lib winmm.lib ^
+             /OUT:dist\engine.exe
+
+      - name: Write version file
+        shell: bash
+        run: echo "${{ github.sha }}" > dist/version.txt
+
+      - name: Commit built files
+        shell: bash
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add dist/engine.exe dist/version.txt
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Build engine.exe ($(git rev-parse --short HEAD))"
+          git push
