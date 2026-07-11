@@ -1,8 +1,8 @@
 name: Build macro engine
 
-# Rebuilds engine.exe on every push that touches engine.cpp, using
+# Rebuilds soru.exe on every push that touches engine.cpp, using
 # GitHub's own Windows runner — no local Visual Studio needed.
-# The compiled exe is committed straight to dist/engine.exe, along
+# The compiled exe is committed straight to dist/soru.exe, along
 # with dist/version.txt (the commit SHA), so the AHK script can pull
 # both directly from raw.githubusercontent.com.
 
@@ -11,6 +11,8 @@ on:
     branches: [main]
     paths:
       - "engine.cpp"
+      - "soru.rc"
+      - "soru.ico"
       - ".github/workflows/build.yml"
   workflow_dispatch: {}
 
@@ -26,14 +28,15 @@ jobs:
       - name: Set up MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Compile engine.exe
+      - name: Compile soru.exe
         shell: cmd
         run: |
           mkdir dist
-          cl /O2 /EHsc /nologo engine.cpp ^
+          rc /nologo soru.rc
+          cl /O2 /EHsc /nologo engine.cpp soru.res ^
              /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup ^
              user32.lib gdi32.lib winmm.lib ^
-             /OUT:dist\engine.exe
+             /OUT:dist\soru.exe
 
       - name: Write version file
         shell: bash
@@ -44,16 +47,6 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add dist/engine.exe dist/version.txt
-          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Build engine.exe ($(git rev-parse --short HEAD))"
-          # Someone may have pushed to main while this job was running
-          # (e.g. two commits in quick succession triggering overlapping
-          # runs). Rebase onto the latest main before pushing so we
-          # never get a rejected push, retrying a couple of times in
-          # case of another race.
-          for i in 1 2 3; do
-            git fetch origin main
-            git rebase origin/main && break
-            sleep 5
-          done
+          git add dist/soru.exe dist/version.txt
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Build soru.exe ($(git rev-parse --short HEAD))"
           git push
