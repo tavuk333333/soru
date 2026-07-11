@@ -46,4 +46,14 @@ jobs:
           git config user.email "actions@github.com"
           git add dist/engine.exe dist/version.txt
           git diff --cached --quiet && echo "No changes to commit" || git commit -m "Build engine.exe ($(git rev-parse --short HEAD))"
+          # Someone may have pushed to main while this job was running
+          # (e.g. two commits in quick succession triggering overlapping
+          # runs). Rebase onto the latest main before pushing so we
+          # never get a rejected push, retrying a couple of times in
+          # case of another race.
+          for i in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main && break
+            sleep 5
+          done
           git push
