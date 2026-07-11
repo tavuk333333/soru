@@ -174,6 +174,19 @@ static void PressKeyGroup(const std::string& group) {
 //  classic-INI format AHK's IniRead/IniWrite writes — no parser needed)
 // ══════════════════════════════════════════════════════════════
 static std::string g_configPath;
+static std::string g_statusPath;   // written on each cycle so AHK can show a tooltip
+
+// Cheap, infrequent (only called when the cycle key fires) — writes just
+// the current group's characters, overwriting the file each time.
+static void WriteGroupStatus(const std::string& groupName) {
+    if (g_statusPath.empty()) return;
+    HANDLE h = CreateFileA(g_statusPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    WriteFile(h, groupName.data(), (DWORD)groupName.size(), &written, NULL);
+    CloseHandle(h);
+}
 static FILETIME g_lastConfigWrite{};
 
 static std::vector<std::string> SplitGroups(const std::string& text) {
@@ -291,6 +304,7 @@ static void MacroLoop() {
             bool cycleDown = KeyPhysicallyDown(cycleVK);
             if (cycleDown && !prevCycleDown && s.keyGroups.size() >= 2) {
                 currentGroupIndex = (currentGroupIndex + 1) % (int)s.keyGroups.size();
+                WriteGroupStatus(s.keyGroups[currentGroupIndex]);   // lets AHK show a tooltip
             }
             prevCycleDown = cycleDown;
             if (currentGroupIndex >= (int)s.keyGroups.size()) currentGroupIndex = 0;
@@ -359,6 +373,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     g_configPath = argv[1];
+    {
+        size_t slash = g_configPath.find_last_of("\\/");
+        std::string dir = (slash == std::string::npos) ? "" : g_configPath.substr(0, slash + 1);
+        g_statusPath = dir + "engine_status.txt";
+    }
     DWORD mainPID = (argc >= 3) ? (DWORD)atoi(argv[2]) : 0;
 
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
