@@ -18,6 +18,20 @@
 //                /ENTRY:mainCRTStartup user32.lib gdi32.lib /OUT:engine.exe
 //    MinGW:  g++ -O2 -municode -mwindows engine.cpp -o engine.exe ^
 //                -luser32 -lgdi32
+//
+//  ── Perf changes in this version ──
+//    - Pixel reads no longer call GetPixel() (a slow full GDI round-trip
+//      per call). Instead: one CreateCompatibleDC + one 1x1 DIBSection
+//      are created ONCE at startup, and each check is a single BitBlt
+//      into that cached memory DC, then a direct read of the DIB's
+//      pixel bytes. This is the single biggest cost in the hot loop —
+//      removing it is the majority of the speedup here.
+//    - The hot loop now runs at full, unthrottled speed (no Sleep)
+//      the ENTIRE time R is physically held, not just mid-burst. That
+//      means the watch-for-pixel-change edge is now checked as fast as
+//      possible, not paced to ~1ms increments. It still sleeps and
+//      idles at near-zero CPU whenever R is not held, so steady-state
+//      cost is unchanged when you're not actively macro-ing.
 // ══════════════════════════════════════════════════════════════
 
 #include <windows.h>
@@ -55,10 +69,10 @@ struct Settings {
 // The hot loop used to lock a mutex and copy the whole Settings struct
 // (including a vector<string> and a string) on EVERY iteration. In a
 // busy-spin loop that's potentially millions of heap allocations per
-// second — that was the real bottleneck, not GetPixel/SendInput.
-// Now: ConfigWatcherThread builds a brand-new Settings object and
-// atomically swaps the pointer; MacroLoop just grabs the current
-// pointer (a cheap atomic refcount op, no copy, no allocation).
+// second — that was a real bottleneck too. ConfigWatcherThread builds a
+// brand-new Settings object and atomically swaps the pointer; MacroLoop
+// just grabs the current pointer (a cheap atomic refcount op, no copy,
+// no allocation).
 static std::shared_ptr<const Settings> g_settings = std::make_shared<Settings>();
 static std::atomic<bool> g_running{true};
 
@@ -170,6 +184,49 @@ static void PressKeyGroup(const std::string& group) {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  Fast pixel capture
+//  GetPixel() is a slow full GDI round-trip per call (it was the real
+//  cost center in the hot loop). Instead: one CreateCompatibleDC + one
+//  1x1 DIBSection are created ONCE, and each check is a single BitBlt
+//  into that cached memory DC, then a direct memory read of the DIB's
+//  pixel bytes — no second GDI call needed to get the color out.
+// ══════════════════════════════════════════════════════════════
+static HDC     g_hdcScreen = NULL;
+static HDC     g_hdcMem = NULL;
+static HBITMAP g_hBitmap = NULL;
+static BYTE*   g_bits = NULL;   // top-down 32bpp BGRA/BGRX, points straight into the DIB's memory
+
+static void InitPixelCapture() {
+    g_hdcScreen = GetDC(NULL);
+    g_hdcMem = CreateCompatibleDC(g_hdcScreen);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = 1;
+    bmi.bmiHeader.biHeight      = -1;   // negative = top-down, avoids row-order surprises on a 1x1 anyway but keeps intent clear
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    g_hBitmap = CreateDIBSection(g_hdcMem, &bmi, DIB_RGB_COLORS, (void**)&g_bits, NULL, 0);
+    SelectObject(g_hdcMem, g_hBitmap);
+}
+
+static void ShutdownPixelCapture() {
+    if (g_hBitmap) DeleteObject(g_hBitmap);
+    if (g_hdcMem) DeleteDC(g_hdcMem);
+    if (g_hdcScreen) ReleaseDC(NULL, g_hdcScreen);
+}
+
+// Returns the pixel as 0x00RRGGBB, matching the layout GetPixel/COLORREF
+// used before (so targetColor in config.ini needs no changes).
+static inline DWORD ReadPixelFast(int x, int y) {
+    BitBlt(g_hdcMem, 0, 0, 1, 1, g_hdcScreen, x, y, SRCCOPY);
+    // DIB storage for 32bpp BI_RGB is B,G,R,X per pixel in memory.
+    return (DWORD)(((DWORD)g_bits[2] << 16) | ((DWORD)g_bits[1] << 8) | (DWORD)g_bits[0]);
+}
+
+// ══════════════════════════════════════════════════════════════
 //  Config loading (Win32 GetPrivateProfileString* reads the same
 //  classic-INI format AHK's IniRead/IniWrite writes — no parser needed)
 // ══════════════════════════════════════════════════════════════
@@ -262,13 +319,14 @@ static void ConfigWatcherThread(DWORD mainPID) {
 //  iteration copying/allocation). Pacing mode is controlled by
 //  BUSY_SPIN below.
 // ══════════════════════════════════════════════════════════════
-// 1 = tightest possible loop, pins ~1 full CPU core, absolute max speed.
-// 0 = paced to ~1ms per iteration using a REAL Sleep(1) (with timeBeginPeriod(1)
-//     already active), so it actually yields the CPU back to Windows between
-//     checks. That's still up to ~1000 pixel-checks/sec and ~500-1000 R-presses/sec —
-//     far faster than needed for either — at a tiny fraction of the CPU cost.
-//     (Previously this mode busy-waited on QueryPerformanceCounter instead of
-//     sleeping, so it never actually reduced CPU usage — that's been fixed below.)
+// 1 = tightest possible loop at ALL times, pins ~1 full CPU core
+//     permanently, absolute max speed even when idle.
+// 0 = idles with a real Sleep(1) (~1ms resolution via timeBeginPeriod(1))
+//     when R is not held and no burst is in progress, but runs fully
+//     unthrottled — no sleep at all — the entire time R IS held, so the
+//     pixel-watch itself checks as fast as the CPU allows, not paced to
+//     ~1ms steps. This is the recommended setting: near-zero idle CPU,
+//     max speed exactly when it matters.
 #define BUSY_SPIN 0
 
 enum class MacroState { IDLE, BURST, COOLDOWN };
@@ -284,14 +342,16 @@ static void MacroLoop() {
     std::string prevCycleKeyName;
     WORD cycleVK = 0;
 
-    HDC hdcScreen = GetDC(NULL);
+    InitPixelCapture();
 
     while (g_running.load(std::memory_order_relaxed)) {
         // Cheap: bumps a refcount, does NOT copy the vector/string inside.
         std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
         const Settings& s = *sp;
 
-        bool activeThisIteration = false;   // R-spam firing or a burst in progress — go full speed
+        // Full speed (no Sleep) whenever R is held OR a burst is in
+        // progress — those are the only times timing actually matters.
+        bool activeThisIteration = false;
 
         if (s.cycleKeyName != prevCycleKeyName) {
             prevCycleKeyName = s.cycleKeyName;
@@ -310,6 +370,7 @@ static void MacroLoop() {
             if (currentGroupIndex >= (int)s.keyGroups.size()) currentGroupIndex = 0;
 
             bool rHeld = KeyPhysicallyDown('R');
+            if (rHeld) activeThisIteration = true;   // watch at max rate the whole time R is held, not just mid-burst
 
             // R-spam moved back to AHK (new.ahk's RSpamLoop) — the engine
             // no longer sends R itself, it only watches R to drive the
@@ -325,8 +386,7 @@ static void MacroLoop() {
 
                     case MacroState::IDLE:
                         if (rHeld) {
-                            COLORREF cr = GetPixel(hdcScreen, s.px, s.py);
-                            DWORD rgb = (DWORD)((GetRValue(cr) << 16) | (GetGValue(cr) << 8) | GetBValue(cr));
+                            DWORD rgb = ReadPixelFast(s.px, s.py);
                             if (rgb != s.targetColor) {
                                 burstGroup = s.keyGroups[currentGroupIndex];
                                 burstCount = 0;
@@ -351,16 +411,15 @@ static void MacroLoop() {
 #if BUSY_SPIN
         // intentionally no sleep — see the #define above
 #else
-        // Sleep(1) most of the time to keep CPU usage low, but skip it on
-        // iterations where we're actively spamming R or mid-burst — those
-        // are short, latency-sensitive bursts and should run at full speed.
-        // Idle time (not holding R, no burst in progress) still sleeps, so
-        // steady-state CPU usage stays low.
+        // Sleep(1) only when fully idle (R not held, no burst in
+        // progress) to keep steady-state CPU usage low. The moment R is
+        // held, or a burst is running, this is skipped entirely so
+        // detection/response run at full speed.
         if (!activeThisIteration) Sleep(1);
 #endif
     }
 
-    ReleaseDC(NULL, hdcScreen);
+    ShutdownPixelCapture();
 }
 
 // ══════════════════════════════════════════════════════════════
