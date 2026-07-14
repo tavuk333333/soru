@@ -1,41 +1,39 @@
 // ══════════════════════════════════════════════════════════════
 //  Soru Macro Engine — native replacement for macro_engine.ahk
 //
-//  Does exactly what the AHK version did, minus AHK's interpreter
-//  and message-queue overhead:
-//    - watches a screen pixel while R is physically held, and bursts
-//      a key group when it doesn't match a target color
-//    - R passthrough-spam while held
-//    - cycle-groups hotkey (edge-detected, no OS hook)
-//    - re-reads config.ini (written by the AHK GUI) whenever it
-//      changes, on its own low-priority thread — never on the hot path
-//    - exits automatically if the launching AHK GUI process dies
-//
 //  Usage:  engine.exe "<path to config.ini>" <main script PID>
 //
-//  Build (see build.yml for the CI version of this):
+//  Build:
 //    MSVC:   cl /O2 /EHsc engine.cpp /link /SUBSYSTEM:WINDOWS ^
-//                /ENTRY:mainCRTStartup user32.lib gdi32.lib /OUT:engine.exe
+//                /ENTRY:mainCRTStartup user32.lib gdi32.lib d3d11.lib dxgi.lib /OUT:engine.exe
 //    MinGW:  g++ -O2 -municode -mwindows engine.cpp -o engine.exe ^
-//                -luser32 -lgdi32
+//                -luser32 -lgdi32 -ld3d11 -ldxgi
 //
-//  ── Perf changes in this version ──
-//    - Pixel reads no longer call GetPixel() (a slow full GDI round-trip
-//      per call). Instead: one CreateCompatibleDC + one 1x1 DIBSection
-//      are created ONCE at startup, and each check is a single BitBlt
-//      into that cached memory DC, then a direct read of the DIB's
-//      pixel bytes. This is the single biggest cost in the hot loop —
-//      removing it is the majority of the speedup here.
-//    - The hot loop now runs at full, unthrottled speed (no Sleep)
-//      the ENTIRE time R is physically held, not just mid-burst. That
-//      means the watch-for-pixel-change edge is now checked as fast as
-//      possible, not paced to ~1ms increments. It still sleeps and
-//      idles at near-zero CPU whenever R is not held, so steady-state
-//      cost is unchanged when you're not actively macro-ing.
+//  ── Pixel capture in this version ──
+//  Primary path: DXGI Desktop Duplication API. This reads straight from
+//  the GPU's swapchain via AcquireNextFrame(), which only returns once a
+//  genuinely NEW frame has been presented — no polling a possibly-stale
+//  composited surface, no guessing whether what you just read is fresh.
+//  When no new frame is available yet (nothing on screen changed since
+//  the last check), it just reuses the last known pixel color, which is
+//  correct by construction (if nothing changed, the pixel didn't either).
+//
+//  Fallback path: if DXGI init fails for any reason (remote desktop
+//  session, no hardware D3D11 device, output duplication blocked, pixel
+//  is on a monitor/adapter index other than 0, etc.) it falls back
+//  automatically to the BitBlt/DIBSection method, so the engine still
+//  runs — just without the freshness guarantee DXGI gives you.
+//
+//  NOTE: DXGI Desktop Duplication only captures adapter 0 / output 0
+//  (your primary monitor) as written. If your target pixel is on a
+//  different monitor, change the EnumOutputs(0, ...) index in
+//  DupCapture::Init() below.
 // ══════════════════════════════════════════════════════════════
 
 #include <windows.h>
 #include <mmsystem.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -51,6 +49,8 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 #endif
 
 // ── Shared settings, written by ConfigWatcher(), read by MacroLoop() ──
@@ -66,13 +66,6 @@ struct Settings {
     std::vector<std::string> keyGroups;
 };
 
-// The hot loop used to lock a mutex and copy the whole Settings struct
-// (including a vector<string> and a string) on EVERY iteration. In a
-// busy-spin loop that's potentially millions of heap allocations per
-// second — that was a real bottleneck too. ConfigWatcherThread builds a
-// brand-new Settings object and atomically swaps the pointer; MacroLoop
-// just grabs the current pointer (a cheap atomic refcount op, no copy,
-// no allocation).
 static std::shared_ptr<const Settings> g_settings = std::make_shared<Settings>();
 static std::atomic<bool> g_running{true};
 
@@ -85,16 +78,13 @@ static std::string ToUpperCopy(const std::string& s) {
     return r;
 }
 
-// Covers the key names AHK's GetKeyName()/rebind flow can produce for
-// the cycle-groups hotkey, plus plain single letters/digits used in
-// key groups. Extend this table if you rebind to something not listed.
 static WORD KeyNameToVK(const std::string& nameIn) {
     std::string name = ToUpperCopy(nameIn);
 
     if (name.size() == 1) {
         unsigned char c = (unsigned char)name[0];
         if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
-            return (WORD)c;   // VK codes for A-Z/0-9 equal their ASCII value
+            return (WORD)c;
     }
 
     if (name.size() == 2 && name[0] == 'F') {
@@ -123,7 +113,7 @@ static WORD KeyNameToVK(const std::string& nameIn) {
     for (auto& e : table)
         if (name == e.name) return e.vk;
 
-    return 0;   // unknown — caller should treat as "never pressed"
+    return 0;
 }
 
 static bool KeyPhysicallyDown(WORD vk) {
@@ -131,10 +121,6 @@ static bool KeyPhysicallyDown(WORD vk) {
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
-// Sends a keyboard down+up for a single-character key (used for the
-// burst key groups and the R-spam passthrough — never called with
-// mouse buttons). Uses scan codes alongside the VK for better
-// compatibility with games that read raw input instead of VK messages.
 static void SendCharDownUp(char c) {
     WORD vk = KeyNameToVK(std::string(1, c));
     if (vk == 0) return;
@@ -153,10 +139,6 @@ static void SendCharDownUp(char c) {
     SendInput(1, &in[1], sizeof(INPUT));
 }
 
-// Presses every character in the group down together, then releases
-// them all together — a true chord, matching the AHK version's
-// "all downs, then all ups" behavior (important for diagonal-move
-// combos like "WA"). Never called with mouse buttons.
 static void PressKeyGroup(const std::string& group) {
     std::vector<INPUT> downs, ups;
     downs.reserve(group.size());
@@ -184,26 +166,22 @@ static void PressKeyGroup(const std::string& group) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Fast pixel capture
-//  GetPixel() is a slow full GDI round-trip per call (it was the real
-//  cost center in the hot loop). Instead: one CreateCompatibleDC + one
-//  1x1 DIBSection are created ONCE, and each check is a single BitBlt
-//  into that cached memory DC, then a direct memory read of the DIB's
-//  pixel bytes — no second GDI call needed to get the color out.
+//  Fallback pixel capture: BitBlt into a cached 1x1 DIBSection.
+//  Used only if DXGI Desktop Duplication fails to initialize.
 // ══════════════════════════════════════════════════════════════
 static HDC     g_hdcScreen = NULL;
 static HDC     g_hdcMem = NULL;
 static HBITMAP g_hBitmap = NULL;
-static BYTE*   g_bits = NULL;   // top-down 32bpp BGRA/BGRX, points straight into the DIB's memory
+static BYTE*   g_bits = NULL;
 
-static void InitPixelCapture() {
+static void InitBitBltCapture() {
     g_hdcScreen = GetDC(NULL);
     g_hdcMem = CreateCompatibleDC(g_hdcScreen);
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth       = 1;
-    bmi.bmiHeader.biHeight      = -1;   // negative = top-down, avoids row-order surprises on a 1x1 anyway but keeps intent clear
+    bmi.bmiHeader.biHeight      = -1;
     bmi.bmiHeader.biPlanes      = 1;
     bmi.bmiHeader.biBitCount    = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -212,29 +190,161 @@ static void InitPixelCapture() {
     SelectObject(g_hdcMem, g_hBitmap);
 }
 
-static void ShutdownPixelCapture() {
+static void ShutdownBitBltCapture() {
     if (g_hBitmap) DeleteObject(g_hBitmap);
     if (g_hdcMem) DeleteDC(g_hdcMem);
     if (g_hdcScreen) ReleaseDC(NULL, g_hdcScreen);
 }
 
-// Returns the pixel as 0x00RRGGBB, matching the layout GetPixel/COLORREF
-// used before (so targetColor in config.ini needs no changes).
-static inline DWORD ReadPixelFast(int x, int y) {
+static inline DWORD ReadPixelBitBlt(int x, int y) {
     BitBlt(g_hdcMem, 0, 0, 1, 1, g_hdcScreen, x, y, SRCCOPY);
-    // DIB storage for 32bpp BI_RGB is B,G,R,X per pixel in memory.
     return (DWORD)(((DWORD)g_bits[2] << 16) | ((DWORD)g_bits[1] << 8) | (DWORD)g_bits[0]);
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Config loading (Win32 GetPrivateProfileString* reads the same
-//  classic-INI format AHK's IniRead/IniWrite writes — no parser needed)
+//  Primary pixel capture: DXGI Desktop Duplication.
+//  AcquireNextFrame() only returns when the desktop actually changed —
+//  so a successful read is guaranteed fresh, not a possibly-stale
+//  composited frame. A timeout just means nothing changed since the
+//  last check, so the caller keeps using the last known color.
+// ══════════════════════════════════════════════════════════════
+struct DupCapture {
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    IDXGIOutputDuplication* duplication = nullptr;
+    ID3D11Texture2D* stagingTex = nullptr;
+    int desktopX = 0, desktopY = 0;   // this output's top-left in virtual-desktop coords
+    bool ok = false;
+
+    bool Init() {
+        D3D_FEATURE_LEVEL fl;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                        nullptr, 0, D3D11_SDK_VERSION, &device, &fl, &context);
+        if (FAILED(hr) || !device) return false;
+
+        IDXGIDevice* dxgiDevice = nullptr;
+        if (FAILED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice)) || !dxgiDevice)
+            return false;
+
+        IDXGIAdapter* adapter = nullptr;
+        hr = dxgiDevice->GetAdapter(&adapter);
+        dxgiDevice->Release();
+        if (FAILED(hr) || !adapter) return false;
+
+        // Output index 0 = primary monitor. Change this if your pixel
+        // coordinate is on a different monitor.
+        IDXGIOutput* output = nullptr;
+        hr = adapter->EnumOutputs(0, &output);
+        adapter->Release();
+        if (FAILED(hr) || !output) return false;
+
+        DXGI_OUTPUT_DESC outDesc;
+        output->GetDesc(&outDesc);
+        desktopX = outDesc.DesktopCoordinates.left;
+        desktopY = outDesc.DesktopCoordinates.top;
+
+        IDXGIOutput1* output1 = nullptr;
+        hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
+        output->Release();
+        if (FAILED(hr) || !output1) return false;
+
+        hr = output1->DuplicateOutput(device, &duplication);
+        output1->Release();
+        if (FAILED(hr) || !duplication) return false;   // common causes: RDP session, DRM-protected content on screen, no permission
+
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = 1;
+        td.Height = 1;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        hr = device->CreateTexture2D(&td, nullptr, &stagingTex);
+        if (FAILED(hr) || !stagingTex) return false;
+
+        ok = true;
+        return true;
+    }
+
+    // true  = rgbOut holds a freshly-presented pixel
+    // false = no new frame since last call (nothing changed) OR a hard
+    //         error; caller should keep using its last known color either way
+    bool TryReadPixel(int globalX, int globalY, DWORD& rgbOut) {
+        if (!ok) return false;
+
+        IDXGIResource* desktopResource = nullptr;
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        HRESULT hr = duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
+        if (FAILED(hr)) return false;   // e.g. DXGI_ERROR_ACCESS_LOST on mode switch/UAC prompt — caller keeps last known color
+
+        ID3D11Texture2D* frameTex = nullptr;
+        desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&frameTex);
+        desktopResource->Release();
+
+        int lx = globalX - desktopX;
+        int ly = globalY - desktopY;
+        bool success = false;
+
+        if (frameTex && lx >= 0 && ly >= 0) {
+            D3D11_BOX box = { (UINT)lx, (UINT)ly, 0, (UINT)(lx + 1), (UINT)(ly + 1), 1 };
+            context->CopySubresourceRegion(stagingTex, 0, 0, 0, 0, frameTex, 0, &box);
+
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            if (SUCCEEDED(context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+                BYTE* p = (BYTE*)mapped.pData;   // BGRA
+                rgbOut = ((DWORD)p[2] << 16) | ((DWORD)p[1] << 8) | (DWORD)p[0];
+                context->Unmap(stagingTex, 0);
+                success = true;
+            }
+        }
+        if (frameTex) frameTex->Release();
+
+        duplication->ReleaseFrame();
+        return success;
+    }
+
+    void Shutdown() {
+        if (stagingTex) stagingTex->Release();
+        if (duplication) duplication->Release();
+        if (context) context->Release();
+        if (device) device->Release();
+    }
+};
+
+static DupCapture g_dup;
+static bool g_useDup = false;
+static DWORD g_lastKnownRgb = 0xFFFFFFFF;   // sentinel so the very first read always "counts"
+
+static void InitPixelCapture() {
+    g_useDup = g_dup.Init();
+    if (!g_useDup) {
+        InitBitBltCapture();   // fallback — DXGI unavailable (RDP session, no HW D3D11 device, blocked duplication, etc.)
+    }
+}
+
+static void ShutdownPixelCapture() {
+    if (g_useDup) g_dup.Shutdown();
+    else ShutdownBitBltCapture();
+}
+
+static inline DWORD ReadPixel(int x, int y) {
+    if (g_useDup) {
+        DWORD rgb;
+        if (g_dup.TryReadPixel(x, y, rgb)) g_lastKnownRgb = rgb;
+        return g_lastKnownRgb;   // fresh if just updated, otherwise correctly-still-the-same as last frame
+    }
+    return ReadPixelBitBlt(x, y);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Config loading
 // ══════════════════════════════════════════════════════════════
 static std::string g_configPath;
-static std::string g_statusPath;   // written on each cycle so AHK can show a tooltip
+static std::string g_statusPath;
 
-// Cheap, infrequent (only called when the cycle key fires) — writes just
-// the current group's characters, overwriting the file each time.
 static void WriteGroupStatus(const std::string& groupName) {
     if (g_statusPath.empty()) return;
     HANDLE h = CreateFileA(g_statusPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
@@ -252,7 +362,6 @@ static std::vector<std::string> SplitGroups(const std::string& text) {
     while (start <= text.size()) {
         size_t comma = text.find(',', start);
         std::string part = (comma == std::string::npos) ? text.substr(start) : text.substr(start, comma - start);
-        // trim
         size_t a = part.find_first_not_of(" \t\r\n");
         size_t b = part.find_last_not_of(" \t\r\n");
         if (a != std::string::npos) out.push_back(part.substr(a, b - a + 1));
@@ -264,11 +373,6 @@ static std::vector<std::string> SplitGroups(const std::string& text) {
 
 static void LoadConfig() {
     char buf[512];
-
-    // Start from the currently-published settings so anything not present
-    // in the file keeps its existing value. This only runs ~5x/sec on the
-    // low-priority watcher thread, so a copy here is totally fine — it's
-    // the HOT LOOP that must never do this.
     auto s = std::make_shared<Settings>(*std::atomic_load(&g_settings));
 
     s->px = GetPrivateProfileIntA("Macros", "PixelX", s->px, g_configPath.c_str());
@@ -285,7 +389,6 @@ static void LoadConfig() {
     std::atomic_store(&g_settings, std::shared_ptr<const Settings>(s));
 }
 
-// Runs on its own thread, ~5x/sec — the ONLY place that touches disk.
 static void ConfigWatcherThread(DWORD mainPID) {
     while (g_running.load(std::memory_order_relaxed)) {
         if (mainPID != 0) {
@@ -295,7 +398,6 @@ static void ConfigWatcherThread(DWORD mainPID) {
                 CloseHandle(h);
                 if (exited) { g_running.store(false); return; }
             } else {
-                // main process handle unavailable (already gone) — exit too
                 g_running.store(false);
                 return;
             }
@@ -314,19 +416,8 @@ static void ConfigWatcherThread(DWORD mainPID) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Hot loop — pixel watch / burst state machine / cycle hotkey.
-//  Settings are read via a lock-free atomic pointer swap (no per-
-//  iteration copying/allocation). Pacing mode is controlled by
-//  BUSY_SPIN below.
+//  Hot loop
 // ══════════════════════════════════════════════════════════════
-// 1 = tightest possible loop at ALL times, pins ~1 full CPU core
-//     permanently, absolute max speed even when idle.
-// 0 = idles with a real Sleep(1) (~1ms resolution via timeBeginPeriod(1))
-//     when R is not held and no burst is in progress, but runs fully
-//     unthrottled — no sleep at all — the entire time R IS held, so the
-//     pixel-watch itself checks as fast as the CPU allows, not paced to
-//     ~1ms steps. This is the recommended setting: near-zero idle CPU,
-//     max speed exactly when it matters.
 #define BUSY_SPIN 0
 
 enum class MacroState { IDLE, BURST, COOLDOWN };
@@ -345,12 +436,9 @@ static void MacroLoop() {
     InitPixelCapture();
 
     while (g_running.load(std::memory_order_relaxed)) {
-        // Cheap: bumps a refcount, does NOT copy the vector/string inside.
         std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
         const Settings& s = *sp;
 
-        // Full speed (no Sleep) whenever R is held OR a burst is in
-        // progress — those are the only times timing actually matters.
         bool activeThisIteration = false;
 
         if (s.cycleKeyName != prevCycleKeyName) {
@@ -360,21 +448,16 @@ static void MacroLoop() {
         }
 
         if (!s.suspended) {
-            // ── cycle-groups hotkey, edge-detected ──
             bool cycleDown = KeyPhysicallyDown(cycleVK);
             if (cycleDown && !prevCycleDown && s.keyGroups.size() >= 2) {
                 currentGroupIndex = (currentGroupIndex + 1) % (int)s.keyGroups.size();
-                WriteGroupStatus(s.keyGroups[currentGroupIndex]);   // lets AHK show a tooltip
+                WriteGroupStatus(s.keyGroups[currentGroupIndex]);
             }
             prevCycleDown = cycleDown;
             if (currentGroupIndex >= (int)s.keyGroups.size()) currentGroupIndex = 0;
 
             bool rHeld = KeyPhysicallyDown('R');
-            if (rHeld) activeThisIteration = true;   // watch at max rate the whole time R is held, not just mid-burst
-
-            // R-spam moved back to AHK (new.ahk's RSpamLoop) — the engine
-            // no longer sends R itself, it only watches R to drive the
-            // pixel-watch/burst state machine below.
+            if (rHeld) activeThisIteration = true;
 
             if (!s.keyGroups.empty()) {
                 ULONGLONG now = GetTickCount64();
@@ -386,7 +469,7 @@ static void MacroLoop() {
 
                     case MacroState::IDLE:
                         if (rHeld) {
-                            DWORD rgb = ReadPixelFast(s.px, s.py);
+                            DWORD rgb = ReadPixel(s.px, s.py);
                             if (rgb != s.targetColor) {
                                 burstGroup = s.keyGroups[currentGroupIndex];
                                 burstCount = 0;
@@ -398,7 +481,7 @@ static void MacroLoop() {
                     case MacroState::BURST:
                         PressKeyGroup(burstGroup);
                         burstCount++;
-                        activeThisIteration = true;   // finish the burst quickly instead of trickling out at 1ms/press
+                        activeThisIteration = true;
                         if (burstCount >= s.burstSize) {
                             state = MacroState::COOLDOWN;
                             cooldownEndMs = now + (ULONGLONG)(s.cooldownSeconds * 1000.0);
@@ -409,12 +492,7 @@ static void MacroLoop() {
         }
 
 #if BUSY_SPIN
-        // intentionally no sleep — see the #define above
 #else
-        // Sleep(1) only when fully idle (R not held, no burst in
-        // progress) to keep steady-state CPU usage low. The moment R is
-        // held, or a burst is running, this is skipped entirely so
-        // detection/response run at full speed.
         if (!activeThisIteration) Sleep(1);
 #endif
     }
