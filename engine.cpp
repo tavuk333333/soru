@@ -370,14 +370,14 @@ int main(int argc, char** argv) {
     }
     g_configPath = argv[1];
     {
-        // engine_status.txt used to live next to config.ini. It now lives
-        // in %APPDATA%\Soru instead, and is created with the hidden
-        // attribute (see WriteGroupStatusToFile), so it doesn't show up in the
-        // script's own folder during normal browsing.
-        char appData[MAX_PATH];
-        DWORD len = GetEnvironmentVariableA("APPDATA", appData, MAX_PATH);
-        std::string dir = (len > 0 && len < MAX_PATH) ? std::string(appData) + "\\Soru\\" : "";
-        if (!dir.empty()) CreateDirectoryA(dir.c_str(), NULL);
+        // engine_status.txt lives in the same directory as config.ini
+        // (wherever the AHK side's EngineDir points it), created with
+        // the hidden attribute (see WriteGroupStatusToFile). Deriving
+        // this from g_configPath instead of a second hardcoded path
+        // means it can never drift out of sync with where the AHK
+        // script is actually looking for it.
+        size_t slash = g_configPath.find_last_of("\\/");
+        std::string dir = (slash == std::string::npos) ? "" : g_configPath.substr(0, slash + 1);
         g_statusPath = dir + "engine_status.txt";
     }
     DWORD mainPID = (argc >= 3) ? (DWORD)atoi(argv[2]) : 0;
