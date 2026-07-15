@@ -48,7 +48,6 @@
 struct Settings {
     int px = 1049;
     int py = 971;
-    DWORD targetColor = 0xFFFFFF;   // RGB order, matches AHK's PixelGetColor default
     int burstSize = 5;
     double cooldownSeconds = 15.01;
     bool rSpamEnabled = false;
@@ -482,8 +481,15 @@ static void MacroLoop() {
 
                     case MacroState::IDLE:
                         if (rHeld) {
+                            // Fires only when the watched pixel IS pure
+                            // white (#FFFFFF) — not "anything other than
+                            // some configured color". The coordinate
+                            // picker on the AHK side no longer needs to
+                            // capture/store a target color for this to
+                            // work; point it at any spot and the engine
+                            // watches for that spot turning white.
                             DWORD rgb = pixelReader.GetPixelRGB(s.px, s.py);
-                            if (rgb != s.targetColor) {
+                            if (rgb == 0xFFFFFFu) {
                                 burstGroup = s.keyGroups[currentGroupIndex];
                                 burstCount = 0;
                                 state = MacroState::BURST;
