@@ -174,6 +174,32 @@ public:
         m_ready = false;
     }
 
+    // Call once at startup, before anything watches for R being held.
+    // Pays two one-time costs up front instead of on the user's first
+    // real detection:
+    //   1. D3D11CreateDevice + DuplicateOutput + staging texture
+    //      creation (driver/device setup).
+    //   2. Desktop Duplication's first-ever AcquireNextFrame, which
+    //      hands back the whole current desktop as a baseline (no
+    //      prior frame to diff against yet) rather than just a delta
+    //      — noticeably slower than every call after it.
+    // Without this, both costs land invisibly on "first time you
+    // press R after launching," which looks like a mystery one-off
+    // delay that disappears on every later press.
+    void WarmUp() {
+        if (!m_ready && !InitDuplication()) return;
+
+        IDXGIResource* frameResource = nullptr;
+        DXGI_OUTDUPL_FRAME_INFO info{};
+        HRESULT hr = m_duplication->AcquireNextFrame(500, &info, &frameResource);
+        if (SUCCEEDED(hr)) {
+            if (frameResource) frameResource->Release();
+            m_duplication->ReleaseFrame();
+        }
+        // If it timed out or failed here, that's fine — GetPixelRGB's
+        // normal lazy-init path still covers it as a fallback.
+    }
+
     ~PixelReader() { Shutdown(); }
 
 private:
@@ -502,6 +528,7 @@ static void MacroLoop() {
     WORD cycleVK = 0;
 
     PixelReader pixelReader;   // persistent DXGI Desktop Duplication session
+    pixelReader.WarmUp();      // pay device/first-frame cost now, not on the user's first R press
 
     while (g_running.load(std::memory_order_relaxed)) {
         std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
