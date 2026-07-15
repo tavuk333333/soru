@@ -15,13 +15,15 @@
 //
 //  Build (see build.yml for the CI version of this):
 //    MSVC:   cl /O2 /EHsc engine.cpp /link /SUBSYSTEM:WINDOWS ^
-//                /ENTRY:mainCRTStartup user32.lib gdi32.lib /OUT:engine.exe
+//                /ENTRY:mainCRTStartup user32.lib gdi32.lib d3d11.lib dxgi.lib /OUT:engine.exe
 //    MinGW:  g++ -O2 -municode -mwindows engine.cpp -o engine.exe ^
-//                -luser32 -lgdi32
+//                -luser32 -lgdi32 -ld3d11 -ldxgi
 // ══════════════════════════════════════════════════════════════
 
 #include <windows.h>
 #include <mmsystem.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -38,6 +40,8 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 #endif
 
 // ── Shared settings, written by ConfigWatcher(), read by MacroLoop() ──
@@ -55,6 +59,157 @@ struct Settings {
 
 static std::shared_ptr<const Settings> g_settings = std::make_shared<Settings>();
 static std::atomic<bool> g_running{true};
+
+// ══════════════════════════════════════════════════════════════
+//  Fast pixel read via DXGI Desktop Duplication.
+//
+//  GetPixel() goes through the full legacy GDI stack for a single
+//  pixel, which is genuinely one of the slower ways to read the
+//  screen. Desktop Duplication instead keeps a persistent handle to
+//  the compositor's actual output texture on the GPU; each poll here
+//  copies just the one texel we care about into a 1x1 staging
+//  texture (CopySubresourceRegion with a 1x1 box) and reads it back —
+//  a few bytes across the GPU/CPU boundary instead of a whole-frame
+//  transfer, and no GDI call chain at all.
+//
+//  Not called from anywhere but MacroLoop's own thread, so no locking.
+// ══════════════════════════════════════════════════════════════
+class PixelReader {
+public:
+    // Non-blocking. Coordinates are virtual-screen coordinates, same
+    // space GetPixel(GetDC(NULL), x, y) used. On any failure (no frame
+    // change yet, device lost, point off this output, etc.) this falls
+    // back to the last known-good value instead of stalling the hot
+    // loop — a stale-by-one-poll pixel is far cheaper than a block.
+    DWORD GetPixelRGB(int x, int y) {
+        if (!m_ready && !InitDuplication()) return m_lastRGB;
+
+        int localX = x - m_outputRect.left;
+        int localY = y - m_outputRect.top;
+        if (localX < 0 || localY < 0 || localX >= m_width || localY >= m_height)
+            return m_lastRGB;   // configured pixel isn't on this output
+
+        IDXGIResource* frameResource = nullptr;
+        DXGI_OUTDUPL_FRAME_INFO info{};
+        HRESULT hr = m_duplication->AcquireNextFrame(0, &info, &frameResource);
+
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            return m_lastRGB;   // desktop hasn't changed since last poll
+        }
+        if (FAILED(hr)) {
+            // ACCESS_LOST (fullscreen-exclusive app took over, res
+            // change, driver reset, etc.) or anything else unexpected —
+            // tear down, the next call lazily reinitializes.
+            Shutdown();
+            return m_lastRGB;
+        }
+
+        ID3D11Texture2D* frameTex = nullptr;
+        hr = frameResource->QueryInterface(IID_PPV_ARGS(&frameTex));
+        frameResource->Release();
+        if (FAILED(hr)) {
+            m_duplication->ReleaseFrame();
+            return m_lastRGB;
+        }
+
+        D3D11_BOX box{};
+        box.left = (UINT)localX; box.right = (UINT)localX + 1;
+        box.top = (UINT)localY;  box.bottom = (UINT)localY + 1;
+        box.front = 0; box.back = 1;
+        m_context->CopySubresourceRegion(m_stagingTex, 0, 0, 0, 0, frameTex, 0, &box);
+        frameTex->Release();
+        m_duplication->ReleaseFrame();
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = m_context->Map(m_stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) return m_lastRGB;
+
+        // Desktop Duplication delivers B8G8R8A8_UNORM; reorder to match
+        // the RGB byte order GetPixel/PixelGetColor callers expect.
+        BYTE* p = (BYTE*)mapped.pData;
+        DWORD rgb = ((DWORD)p[2] << 16) | ((DWORD)p[1] << 8) | (DWORD)p[0];
+        m_context->Unmap(m_stagingTex, 0);
+
+        m_lastRGB = rgb;
+        return rgb;
+    }
+
+    void Shutdown() {
+        if (m_stagingTex)  { m_stagingTex->Release();  m_stagingTex = nullptr; }
+        if (m_duplication) { m_duplication->Release();  m_duplication = nullptr; }
+        if (m_context)     { m_context->Release();      m_context = nullptr; }
+        if (m_device)      { m_device->Release();       m_device = nullptr; }
+        m_ready = false;
+    }
+
+    ~PixelReader() { Shutdown(); }
+
+private:
+    bool InitDuplication() {
+        Shutdown();
+
+        D3D_FEATURE_LEVEL fl;
+        HRESULT hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+            nullptr, 0, D3D11_SDK_VERSION, &m_device, &fl, &m_context);
+        if (FAILED(hr)) return false;
+
+        IDXGIDevice* dxgiDevice = nullptr;
+        if (FAILED(m_device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)))) return false;
+        IDXGIAdapter* adapter = nullptr;
+        hr = dxgiDevice->GetAdapter(&adapter);
+        dxgiDevice->Release();
+        if (FAILED(hr)) return false;
+
+        IDXGIOutput* output = nullptr;
+        // Primary output only. If your target pixel can be on a second
+        // monitor, this needs to enumerate outputs and pick the one
+        // whose DesktopCoordinates contains (x, y) instead of hardcoding 0.
+        hr = adapter->EnumOutputs(0, &output);
+        adapter->Release();
+        if (FAILED(hr)) return false;
+
+        DXGI_OUTPUT_DESC outDesc{};
+        output->GetDesc(&outDesc);
+        m_outputRect = outDesc.DesktopCoordinates;
+        m_width  = m_outputRect.right  - m_outputRect.left;
+        m_height = m_outputRect.bottom - m_outputRect.top;
+
+        IDXGIOutput1* output1 = nullptr;
+        hr = output->QueryInterface(IID_PPV_ARGS(&output1));
+        output->Release();
+        if (FAILED(hr)) return false;
+
+        hr = output1->DuplicateOutput(m_device, &m_duplication);
+        output1->Release();
+        if (FAILED(hr)) return false;   // e.g. another exclusive duplicator already attached, or running over RDP
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = 1;
+        desc.Height = 1;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        hr = m_device->CreateTexture2D(&desc, nullptr, &m_stagingTex);
+        if (FAILED(hr)) return false;
+
+        m_ready = true;
+        return true;
+    }
+
+    ID3D11Device*           m_device      = nullptr;
+    ID3D11DeviceContext*    m_context     = nullptr;
+    IDXGIOutputDuplication* m_duplication = nullptr;
+    ID3D11Texture2D*        m_stagingTex  = nullptr;
+    RECT  m_outputRect{};
+    int   m_width  = 0;
+    int   m_height = 0;
+    bool  m_ready  = false;
+    DWORD m_lastRGB = 0;
+};
 
 // ══════════════════════════════════════════════════════════════
 //  Key name <-> virtual key code
@@ -292,7 +447,7 @@ static void MacroLoop() {
     std::string prevCycleKeyName;
     WORD cycleVK = 0;
 
-    HDC hdcScreen = GetDC(NULL);
+    PixelReader pixelReader;   // persistent DXGI Desktop Duplication session
 
     while (g_running.load(std::memory_order_relaxed)) {
         std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
@@ -327,8 +482,7 @@ static void MacroLoop() {
 
                     case MacroState::IDLE:
                         if (rHeld) {
-                            COLORREF cr = GetPixel(hdcScreen, s.px, s.py);
-                            DWORD rgb = (DWORD)((GetRValue(cr) << 16) | (GetGValue(cr) << 8) | GetBValue(cr));
+                            DWORD rgb = pixelReader.GetPixelRGB(s.px, s.py);
                             if (rgb != s.targetColor) {
                                 burstGroup = s.keyGroups[currentGroupIndex];
                                 burstCount = 0;
@@ -355,8 +509,7 @@ static void MacroLoop() {
         if (!activeThisIteration) Sleep(1);
 #endif
     }
-
-    ReleaseDC(NULL, hdcScreen);
+    // pixelReader's destructor releases the D3D11 device/duplication/texture.
 }
 
 // ══════════════════════════════════════════════════════════════
