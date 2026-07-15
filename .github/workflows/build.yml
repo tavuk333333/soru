@@ -33,9 +33,9 @@ jobs:
         run: |
           mkdir dist
           rc /nologo soru.rc
-          cl /O2 /EHsc /nologo engine.cpp soru.res ^
+          cl /O2 /EHsc /MD /nologo engine.cpp soru.res ^
              /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup ^
-             user32.lib gdi32.lib winmm.lib ^
+             user32.lib gdi32.lib d3d11.lib dxgi.lib winmm.lib ^
              /OUT:dist\soru.exe
 
       - name: Write version file
