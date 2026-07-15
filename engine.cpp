@@ -18,6 +18,19 @@
 //                /ENTRY:mainCRTStartup user32.lib gdi32.lib d3d11.lib dxgi.lib /OUT:engine.exe
 //    MinGW:  g++ -O2 -municode -mwindows engine.cpp -o engine.exe ^
 //                -luser32 -lgdi32 -ld3d11 -ldxgi
+//
+//  ── Change log ──
+//  PixelReader::GetPixelRGB used to call AcquireNextFrame(0, ...)
+//  (non-blocking) and the hot loop covered the gap with Sleep(1) when
+//  idle. Reverse-engineering an older, faster build showed it instead
+//  calls AcquireNextFrame with a small nonzero timeout and never
+//  Sleep()s on the polling path at all. That matters because
+//  AcquireNextFrame's blocking wait is driven by the desktop
+//  compositor's own present event — it returns the instant a new
+//  frame is actually ready, not on Windows' coarse ~0.5-2ms Sleep(1)
+//  timer granularity. So the old build wasn't polling faster, it was
+//  just not stacking an extra timer-resolution delay on top of the
+//  GPU's own readiness signal. See kAcquireTimeoutMs below.
 // ══════════════════════════════════════════════════════════════
 
 #include <windows.h>
@@ -75,11 +88,30 @@ static std::atomic<bool> g_running{true};
 // ══════════════════════════════════════════════════════════════
 class PixelReader {
 public:
-    // Non-blocking. Coordinates are virtual-screen coordinates, same
-    // space GetPixel(GetDC(NULL), x, y) used. On any failure (no frame
-    // change yet, device lost, point off this output, etc.) this falls
-    // back to the last known-good value instead of stalling the hot
-    // loop — a stale-by-one-poll pixel is far cheaper than a block.
+    // How long AcquireNextFrame is allowed to block waiting for a new
+    // compositor frame. 0 = non-blocking (returns WAIT_TIMEOUT
+    // immediately if nothing changed, which forces the caller to add
+    // its own Sleep() between polls — that's what the old, slower
+    // build's replacement effectively removed). A short nonzero value
+    // instead lets the driver park the thread and wake it exactly
+    // when a new frame presents, which is both lower-latency and
+    // cheaper than hundreds of non-blocking driver round trips per
+    // second.
+    //
+    // 15ms is what the reference build used and matches typical
+    // 60-90Hz present cadence closely. If R-release / cycle-key
+    // detection (checked once per loop iteration, same as the pixel
+    // poll) needs to feel snappier than that, drop this to something
+    // like 4-8ms — still far better than Sleep(1)'s jitter, at the
+    // cost of a few more idle wakeups per second.
+    static constexpr UINT kAcquireTimeoutMs = 15;
+
+    // Non-blocking beyond kAcquireTimeoutMs. Coordinates are
+    // virtual-screen coordinates, same space GetPixel(GetDC(NULL), x, y)
+    // used. On any failure (no frame change within the timeout, device
+    // lost, point off this output, etc.) this falls back to the last
+    // known-good value instead of stalling the hot loop indefinitely —
+    // a stale-by-one-poll pixel is far cheaper than an unbounded block.
     DWORD GetPixelRGB(int x, int y) {
         if (!m_ready && !InitDuplication()) return m_lastRGB;
 
@@ -90,10 +122,10 @@ public:
 
         IDXGIResource* frameResource = nullptr;
         DXGI_OUTDUPL_FRAME_INFO info{};
-        HRESULT hr = m_duplication->AcquireNextFrame(0, &info, &frameResource);
+        HRESULT hr = m_duplication->AcquireNextFrame(kAcquireTimeoutMs, &info, &frameResource);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            return m_lastRGB;   // desktop hasn't changed since last poll
+            return m_lastRGB;   // desktop hasn't changed within the timeout window
         }
         if (FAILED(hr)) {
             // ACCESS_LOST (fullscreen-exclusive app took over, res
@@ -453,6 +485,11 @@ static void MacroLoop() {
         const Settings& s = *sp;
 
         bool activeThisIteration = false;
+        // Set whenever this iteration already blocked inside
+        // AcquireNextFrame (kAcquireTimeoutMs). That wait already
+        // paces the loop, so the Sleep(1) below would only add
+        // needless extra latency on top of it — skip it in that case.
+        bool didBlockingPixelRead = false;
 
         if (s.cycleKeyName != prevCycleKeyName) {
             prevCycleKeyName = s.cycleKeyName;
@@ -488,7 +525,13 @@ static void MacroLoop() {
                             // capture/store a target color for this to
                             // work; point it at any spot and the engine
                             // watches for that spot turning white.
+                            //
+                            // This call blocks for up to
+                            // PixelReader::kAcquireTimeoutMs waiting on
+                            // the compositor's own frame-ready signal —
+                            // that block IS this iteration's pacing.
                             DWORD rgb = pixelReader.GetPixelRGB(s.px, s.py);
+                            didBlockingPixelRead = true;
                             if (rgb == 0xFFFFFFu) {
                                 burstGroup = s.keyGroups[currentGroupIndex];
                                 burstCount = 0;
@@ -512,7 +555,12 @@ static void MacroLoop() {
 
 #if BUSY_SPIN
 #else
-        if (!activeThisIteration) Sleep(1);
+        // Only sleep when nothing already paced this iteration for us:
+        // not mid-burst, and not an IDLE poll that just blocked inside
+        // AcquireNextFrame. Everything else (suspended, cooldown,
+        // R not held, no key groups configured) still needs this so
+        // the loop doesn't spin the core at 100%.
+        if (!activeThisIteration && !didBlockingPixelRead) Sleep(1);
 #endif
     }
     // pixelReader's destructor releases the D3D11 device/duplication/texture.
