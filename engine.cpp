@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════════════════
-//  Soru Macro Engine — native replacement for macro_engine.ahk
+//  Soru Macro Engine — native replacement for macro_engine.ahk ha
 //
 //  Does exactly what the AHK version did, minus AHK's interpreter
 //  and message-queue overhead:
