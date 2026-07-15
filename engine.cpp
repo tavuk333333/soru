@@ -48,6 +48,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "winmm.lib")
@@ -312,13 +313,30 @@ static void SendCharDownUp(char c) {
     SendInput(1, &in[1], sizeof(INPUT));
 }
 
-static void PressKeyGroup(const std::string& group) {
-    std::vector<INPUT> downs, ups;
-    downs.reserve(group.size());
-    ups.reserve(group.size());
+// Fixed-size stack arrays instead of std::vector: no heap allocation on
+// this path at all. A key group is realistically a handful of chars
+// (move keys, ability keys), so 32 is generous headroom; anything
+// beyond that is silently dropped rather than allocating.
+//
+// This matters specifically because the hot thread runs alongside
+// ConfigWatcherThread, and both share the single process-wide CRT
+// heap lock. If PressKeyGroup allocated here and the watcher thread's
+// LoadConfig() happened to be mid-allocation (make_shared<Settings>,
+// string/vector copies) at the same instant, the hot thread — even at
+// TIME_CRITICAL — would have to wait for that lock. That's a classic
+// priority-inversion stall, and it doesn't need to happen often to
+// show up as an occasional extra frame of input latency.
+static void PressKeyGroup(const char* group, size_t len) {
+    constexpr size_t kMaxKeys = 32;
+    if (len > kMaxKeys) len = kMaxKeys;
 
-    for (char c : group) {
-        WORD vk = KeyNameToVK(std::string(1, c));
+    INPUT downs[kMaxKeys];
+    INPUT ups[kMaxKeys];
+    UINT count = 0;
+
+    for (size_t i = 0; i < len; ++i) {
+        char c = group[i];
+        WORD vk = KeyNameToVK(std::string(1, c));   // 1-char string: always SSO, no heap
         if (vk == 0) continue;
         WORD scan = (WORD)MapVirtualKey(vk, MAPVK_VK_TO_VSC);
 
@@ -327,15 +345,17 @@ static void PressKeyGroup(const std::string& group) {
         down.ki.wVk = vk;
         down.ki.wScan = scan;
         down.ki.dwFlags = KEYEVENTF_SCANCODE;
-        downs.push_back(down);
+        downs[count] = down;
 
         INPUT up = down;
         up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-        ups.push_back(up);
+        ups[count] = up;
+
+        ++count;
     }
 
-    if (!downs.empty()) SendInput((UINT)downs.size(), downs.data(), sizeof(INPUT));
-    if (!ups.empty())   SendInput((UINT)ups.size(),   ups.data(),   sizeof(INPUT));
+    if (count) SendInput(count, downs, sizeof(INPUT));
+    if (count) SendInput(count, ups,   sizeof(INPUT));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -470,7 +490,10 @@ enum class MacroState { IDLE, BURST, COOLDOWN };
 static void MacroLoop() {
     MacroState state = MacroState::IDLE;
     int burstCount = 0;
-    std::string burstGroup;
+    // Fixed buffer, not std::string: latching the group name at BURST
+    // start must not allocate (see PressKeyGroup's comment above).
+    char burstGroup[32] = {};
+    size_t burstGroupLen = 0;
     ULONGLONG cooldownEndMs = 0;
     int currentGroupIndex = 0;
 
@@ -533,7 +556,10 @@ static void MacroLoop() {
                             DWORD rgb = pixelReader.GetPixelRGB(s.px, s.py);
                             didBlockingPixelRead = true;
                             if (rgb == 0xFFFFFFu) {
-                                burstGroup = s.keyGroups[currentGroupIndex];
+                                const std::string& g = s.keyGroups[currentGroupIndex];
+                                burstGroupLen = g.size() < sizeof(burstGroup) - 1
+                                                    ? g.size() : sizeof(burstGroup) - 1;
+                                memcpy(burstGroup, g.data(), burstGroupLen);
                                 burstCount = 0;
                                 state = MacroState::BURST;
                             }
@@ -541,7 +567,7 @@ static void MacroLoop() {
                         break;
 
                     case MacroState::BURST:
-                        PressKeyGroup(burstGroup);
+                        PressKeyGroup(burstGroup, burstGroupLen);
                         burstCount++;
                         activeThisIteration = true;
                         if (burstCount >= s.burstSize) {
