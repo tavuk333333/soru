@@ -29,6 +29,7 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -52,13 +53,6 @@ struct Settings {
     std::vector<std::string> keyGroups;
 };
 
-// The hot loop used to lock a mutex and copy the whole Settings struct
-// (including a vector<string> and a string) on EVERY iteration. In a
-// busy-spin loop that's potentially millions of heap allocations per
-// second — that was the real bottleneck, not GetPixel/SendInput.
-// Now: ConfigWatcherThread builds a brand-new Settings object and
-// atomically swaps the pointer; MacroLoop just grabs the current
-// pointer (a cheap atomic refcount op, no copy, no allocation).
 static std::shared_ptr<const Settings> g_settings = std::make_shared<Settings>();
 static std::atomic<bool> g_running{true};
 
@@ -71,16 +65,13 @@ static std::string ToUpperCopy(const std::string& s) {
     return r;
 }
 
-// Covers the key names AHK's GetKeyName()/rebind flow can produce for
-// the cycle-groups hotkey, plus plain single letters/digits used in
-// key groups. Extend this table if you rebind to something not listed.
 static WORD KeyNameToVK(const std::string& nameIn) {
     std::string name = ToUpperCopy(nameIn);
 
     if (name.size() == 1) {
         unsigned char c = (unsigned char)name[0];
         if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
-            return (WORD)c;   // VK codes for A-Z/0-9 equal their ASCII value
+            return (WORD)c;
     }
 
     if (name.size() == 2 && name[0] == 'F') {
@@ -109,7 +100,7 @@ static WORD KeyNameToVK(const std::string& nameIn) {
     for (auto& e : table)
         if (name == e.name) return e.vk;
 
-    return 0;   // unknown — caller should treat as "never pressed"
+    return 0;
 }
 
 static bool KeyPhysicallyDown(WORD vk) {
@@ -117,10 +108,6 @@ static bool KeyPhysicallyDown(WORD vk) {
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
-// Sends a keyboard down+up for a single-character key (used for the
-// burst key groups and the R-spam passthrough — never called with
-// mouse buttons). Uses scan codes alongside the VK for better
-// compatibility with games that read raw input instead of VK messages.
 static void SendCharDownUp(char c) {
     WORD vk = KeyNameToVK(std::string(1, c));
     if (vk == 0) return;
@@ -139,10 +126,6 @@ static void SendCharDownUp(char c) {
     SendInput(1, &in[1], sizeof(INPUT));
 }
 
-// Presses every character in the group down together, then releases
-// them all together — a true chord, matching the AHK version's
-// "all downs, then all ups" behavior (important for diagonal-move
-// combos like "WA"). Never called with mouse buttons.
 static void PressKeyGroup(const std::string& group) {
     std::vector<INPUT> downs, ups;
     downs.reserve(group.size());
@@ -170,22 +153,47 @@ static void PressKeyGroup(const std::string& group) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Config loading (Win32 GetPrivateProfileString* reads the same
-//  classic-INI format AHK's IniRead/IniWrite writes — no parser needed)
+//  Config loading
 // ══════════════════════════════════════════════════════════════
 static std::string g_configPath;
 static std::string g_statusPath;   // written on each cycle so AHK can show a tooltip
 
-// Cheap, infrequent (only called when the cycle key fires) — writes just
-// the current group's characters, overwriting the file each time.
-static void WriteGroupStatus(const std::string& groupName) {
+// engine_status.txt now lives in %APPDATA%\Soru instead of next to
+// config.ini, and is created with the hidden attribute, so it no
+// longer shows up in the script's own folder during normal browsing.
+//
+// The actual disk write is now done on the low-priority watcher thread,
+// not the TIME_CRITICAL hot thread. RequestGroupStatus() (called from
+// the hot thread) just stores a string under a mutex and returns —
+// microseconds, no I/O. WriteGroupStatusToFile() (called from the watcher
+// thread) does the real CreateFileA/WriteFile/CloseHandle, outside the
+// lock, so the hot thread is never blocked behind a disk operation.
+static std::mutex g_statusMutex;
+static std::condition_variable g_statusCV;
+static std::string g_pendingStatus;
+static bool g_statusDirty = false;
+
+static void RequestGroupStatus(const std::string& groupName) {
+    {
+        std::lock_guard<std::mutex> lock(g_statusMutex);
+        g_pendingStatus = groupName;
+        g_statusDirty = true;
+    }
+    g_statusCV.notify_one();
+}
+
+static void WriteGroupStatusToFile(const std::string& groupName) {
     if (g_statusPath.empty()) return;
     HANDLE h = CreateFileA(g_statusPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
     DWORD written;
     WriteFile(h, groupName.data(), (DWORD)groupName.size(), &written, NULL);
     CloseHandle(h);
+    // Belt-and-suspenders: force the hidden attribute even if the file
+    // already existed before this run (CREATE_ALWAYS doesn't always
+    // re-apply attributes to a pre-existing file on every filesystem).
+    SetFileAttributesA(g_statusPath.c_str(), FILE_ATTRIBUTE_HIDDEN);
 }
 static FILETIME g_lastConfigWrite{};
 
@@ -195,7 +203,6 @@ static std::vector<std::string> SplitGroups(const std::string& text) {
     while (start <= text.size()) {
         size_t comma = text.find(',', start);
         std::string part = (comma == std::string::npos) ? text.substr(start) : text.substr(start, comma - start);
-        // trim
         size_t a = part.find_first_not_of(" \t\r\n");
         size_t b = part.find_last_not_of(" \t\r\n");
         if (a != std::string::npos) out.push_back(part.substr(a, b - a + 1));
@@ -208,10 +215,6 @@ static std::vector<std::string> SplitGroups(const std::string& text) {
 static void LoadConfig() {
     char buf[512];
 
-    // Start from the currently-published settings so anything not present
-    // in the file keeps its existing value. This only runs ~5x/sec on the
-    // low-priority watcher thread, so a copy here is totally fine — it's
-    // the HOT LOOP that must never do this.
     auto s = std::make_shared<Settings>(*std::atomic_load(&g_settings));
 
     s->px = GetPrivateProfileIntA("Macros", "PixelX", s->px, g_configPath.c_str());
@@ -228,7 +231,11 @@ static void LoadConfig() {
     std::atomic_store(&g_settings, std::shared_ptr<const Settings>(s));
 }
 
-// Runs on its own thread, ~5x/sec — the ONLY place that touches disk.
+// Also now the only place that writes engine_status.txt: instead of a
+// plain sleep_for(200ms), it waits (with a 200ms timeout) on g_statusCV.
+// That means a pending status update gets flushed to disk promptly when
+// one arrives, but the mainPID/config.ini polling above still runs on
+// its normal ~200ms cadence even when no status update ever shows up.
 static void ConfigWatcherThread(DWORD mainPID) {
     while (g_running.load(std::memory_order_relaxed)) {
         if (mainPID != 0) {
@@ -238,7 +245,6 @@ static void ConfigWatcherThread(DWORD mainPID) {
                 CloseHandle(h);
                 if (exited) { g_running.store(false); return; }
             } else {
-                // main process handle unavailable (already gone) — exit too
                 g_running.store(false);
                 return;
             }
@@ -252,23 +258,25 @@ static void ConfigWatcherThread(DWORD mainPID) {
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::string toWrite;
+        bool haveWork = false;
+        {
+            std::unique_lock<std::mutex> lock(g_statusMutex);
+            g_statusCV.wait_for(lock, std::chrono::milliseconds(200),
+                                 [] { return g_statusDirty || !g_running.load(std::memory_order_relaxed); });
+            if (g_statusDirty) {
+                toWrite = g_pendingStatus;
+                g_statusDirty = false;
+                haveWork = true;
+            }
+        } // lock released before touching disk
+        if (haveWork) WriteGroupStatusToFile(toWrite);
     }
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Hot loop — pixel watch / burst state machine / cycle hotkey.
-//  Settings are read via a lock-free atomic pointer swap (no per-
-//  iteration copying/allocation). Pacing mode is controlled by
-//  BUSY_SPIN below.
+//  Hot loop
 // ══════════════════════════════════════════════════════════════
-// 1 = tightest possible loop, pins ~1 full CPU core, absolute max speed.
-// 0 = paced to ~1ms per iteration using a REAL Sleep(1) (with timeBeginPeriod(1)
-//     already active), so it actually yields the CPU back to Windows between
-//     checks. That's still up to ~1000 pixel-checks/sec and ~500-1000 R-presses/sec —
-//     far faster than needed for either — at a tiny fraction of the CPU cost.
-//     (Previously this mode busy-waited on QueryPerformanceCounter instead of
-//     sleeping, so it never actually reduced CPU usage — that's been fixed below.)
 #define BUSY_SPIN 0
 
 enum class MacroState { IDLE, BURST, COOLDOWN };
@@ -287,11 +295,10 @@ static void MacroLoop() {
     HDC hdcScreen = GetDC(NULL);
 
     while (g_running.load(std::memory_order_relaxed)) {
-        // Cheap: bumps a refcount, does NOT copy the vector/string inside.
         std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
         const Settings& s = *sp;
 
-        bool activeThisIteration = false;   // R-spam firing or a burst in progress — go full speed
+        bool activeThisIteration = false;
 
         if (s.cycleKeyName != prevCycleKeyName) {
             prevCycleKeyName = s.cycleKeyName;
@@ -300,20 +307,15 @@ static void MacroLoop() {
         }
 
         if (!s.suspended) {
-            // ── cycle-groups hotkey, edge-detected ──
             bool cycleDown = KeyPhysicallyDown(cycleVK);
             if (cycleDown && !prevCycleDown && s.keyGroups.size() >= 2) {
                 currentGroupIndex = (currentGroupIndex + 1) % (int)s.keyGroups.size();
-                WriteGroupStatus(s.keyGroups[currentGroupIndex]);   // lets AHK show a tooltip
+                RequestGroupStatus(s.keyGroups[currentGroupIndex]);   // lets AHK show a tooltip; actual disk write happens on the watcher thread
             }
             prevCycleDown = cycleDown;
             if (currentGroupIndex >= (int)s.keyGroups.size()) currentGroupIndex = 0;
 
             bool rHeld = KeyPhysicallyDown('R');
-
-            // R-spam moved back to AHK (new.ahk's RSpamLoop) — the engine
-            // no longer sends R itself, it only watches R to drive the
-            // pixel-watch/burst state machine below.
 
             if (!s.keyGroups.empty()) {
                 ULONGLONG now = GetTickCount64();
@@ -338,7 +340,7 @@ static void MacroLoop() {
                     case MacroState::BURST:
                         PressKeyGroup(burstGroup);
                         burstCount++;
-                        activeThisIteration = true;   // finish the burst quickly instead of trickling out at 1ms/press
+                        activeThisIteration = true;
                         if (burstCount >= s.burstSize) {
                             state = MacroState::COOLDOWN;
                             cooldownEndMs = now + (ULONGLONG)(s.cooldownSeconds * 1000.0);
@@ -349,13 +351,7 @@ static void MacroLoop() {
         }
 
 #if BUSY_SPIN
-        // intentionally no sleep — see the #define above
 #else
-        // Sleep(1) most of the time to keep CPU usage low, but skip it on
-        // iterations where we're actively spamming R or mid-burst — those
-        // are short, latency-sensitive bursts and should run at full speed.
-        // Idle time (not holding R, no burst in progress) still sleeps, so
-        // steady-state CPU usage stays low.
         if (!activeThisIteration) Sleep(1);
 #endif
     }
@@ -374,8 +370,14 @@ int main(int argc, char** argv) {
     }
     g_configPath = argv[1];
     {
-        size_t slash = g_configPath.find_last_of("\\/");
-        std::string dir = (slash == std::string::npos) ? "" : g_configPath.substr(0, slash + 1);
+        // engine_status.txt used to live next to config.ini. It now lives
+        // in %APPDATA%\Soru instead, and is created with the hidden
+        // attribute (see WriteGroupStatusToFile), so it doesn't show up in the
+        // script's own folder during normal browsing.
+        char appData[MAX_PATH];
+        DWORD len = GetEnvironmentVariableA("APPDATA", appData, MAX_PATH);
+        std::string dir = (len > 0 && len < MAX_PATH) ? std::string(appData) + "\\Soru\\" : "";
+        if (!dir.empty()) CreateDirectoryA(dir.c_str(), NULL);
         g_statusPath = dir + "engine_status.txt";
     }
     DWORD mainPID = (argc >= 3) ? (DWORD)atoi(argv[2]) : 0;
@@ -397,6 +399,7 @@ int main(int argc, char** argv) {
     hot.join();
 
     g_running.store(false);
+    g_statusCV.notify_one();   // wake the watcher immediately instead of waiting out its 200ms timeout
     watcher.join();
 
     timeEndPeriod(1);
