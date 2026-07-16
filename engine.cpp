@@ -124,13 +124,26 @@ public:
     // cheaper than hundreds of non-blocking driver round trips per
     // second.
     //
-    // 15ms is what the reference build used and matches typical
-    // 60-90Hz present cadence closely. If R-release / cycle-key
-    // detection (checked once per loop iteration, same as the pixel
-    // poll) needs to feel snappier than that, drop this to something
-    // like 4-8ms — still far better than Sleep(1)'s jitter, at the
-    // cost of a few more idle wakeups per second.
-    static constexpr UINT kAcquireTimeoutMs = 15;
+    // 15ms matches the reference build and typical 60-90Hz present
+    // cadence, but it's a *blocking* wait — the thread sleeps on a
+    // kernel wait object until the driver signals a new frame, and
+    // waking a sleeping thread back up has its own small, variable
+    // OS-scheduling delay on top of the actual frame timing. That
+    // wake jitter is the most likely source of remaining 1-vs-2-frame
+    // inconsistency once heap allocs, thread affinity, and settings
+    // contention are already handled.
+    //
+    // 0 = non-blocking: GetPixelRGB's caller (MacroLoop) re-issues the
+    // call back-to-back in a tight spin with no Sleep() at all while R
+    // is held, so the thread is never asleep and there's no wake-up to
+    // be jittery about. The direct cost: the pinned hot-thread core
+    // sits at ~100% usage for as long as R is held, continuously,
+    // instead of idling between blocking waits. Try this, but actually
+    // compare it against 15 — on a CPU with cores to spare it should
+    // tighten consistency further; on a CPU where that core is also
+    // needed by the game itself, competing for it could hurt more than
+    // the jitter fix helps. Set back to 15 if that's the case for you.
+    static constexpr UINT kAcquireTimeoutMs = 0;
 
     // Non-blocking beyond kAcquireTimeoutMs. Coordinates are
     // virtual-screen coordinates, same space GetPixel(GetDC(NULL), x, y)
