@@ -31,6 +31,25 @@
 //  timer granularity. So the old build wasn't polling faster, it was
 //  just not stacking an extra timer-resolution delay on top of the
 //  GPU's own readiness signal. See kAcquireTimeoutMs below.
+//
+//  The reference build is also single-threaded. This engine still
+//  needs a second thread (config hot-reload, liveness watch, status
+//  writes can't block the hot path), but a live second thread means
+//  the OS can migrate the hot thread between cores, and the two
+//  threads can bounce the same cache line back and forth if they
+//  touch shared state at the same instant. Two changes address that
+//  without giving up the second thread:
+//    1. Both threads get pinned to fixed, distinct cores
+//       (SetThreadAffinityMask in main()), so the scheduler can't
+//       migrate the hot thread mid-loop.
+//    2. The hot loop no longer does an atomic_load<shared_ptr> of
+//       g_settings every single iteration. That call increments/
+//       decrements a refcount on Settings' control block — a cache
+//       line the watcher thread also touches on every LoadConfig().
+//       Now the watcher raises a one-word g_settingsDirty flag when
+//       it actually changes something, and the hot loop only pays
+//       for the shared_ptr reload when that flag is set — otherwise
+//       it just reuses the copy it already has.
 // ══════════════════════════════════════════════════════════════
 
 #include <windows.h>
@@ -72,6 +91,12 @@ struct Settings {
 
 static std::shared_ptr<const Settings> g_settings = std::make_shared<Settings>();
 static std::atomic<bool> g_running{true};
+
+// Raised by the watcher thread whenever it actually stores a new
+// Settings snapshot. The hot loop only does the (comparatively
+// expensive, cross-thread-contended) shared_ptr reload when this is
+// set, instead of on every single iteration.
+static std::atomic<bool> g_settingsDirty{true};   // true so MacroLoop's first iteration loads it
 
 // ══════════════════════════════════════════════════════════════
 //  Fast pixel read via DXGI Desktop Duplication.
@@ -461,6 +486,10 @@ static void LoadConfig() {
     s->cycleKeyName = buf;
 
     std::atomic_store(&g_settings, std::shared_ptr<const Settings>(s));
+    // Tell the hot loop a new snapshot is waiting. release ordering
+    // pairs with the acquire exchange in MacroLoop, so the loop never
+    // sees this flag before it can also see the finished atomic_store above.
+    g_settingsDirty.store(true, std::memory_order_release);
 }
 
 // Also now the only place that writes engine_status.txt: instead of a
@@ -530,8 +559,17 @@ static void MacroLoop() {
     PixelReader pixelReader;   // persistent DXGI Desktop Duplication session
     pixelReader.WarmUp();      // pay device/first-frame cost now, not on the user's first R press
 
+    // Local, persistent settings snapshot. Only reloaded from
+    // g_settings when the watcher thread flags a real change via
+    // g_settingsDirty — see the comment on that flag up top. This is
+    // the only shared_ptr touch on the whole hot path now instead of
+    // one every iteration.
+    std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
+
     while (g_running.load(std::memory_order_relaxed)) {
-        std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
+        if (g_settingsDirty.exchange(false, std::memory_order_acquire)) {
+            sp = std::atomic_load(&g_settings);
+        }
         const Settings& s = *sp;
 
         bool activeThisIteration = false;
@@ -619,6 +657,32 @@ static void MacroLoop() {
     // pixelReader's destructor releases the D3D11 device/duplication/texture.
 }
 
+// Picks two distinct logical processors from the set this process is
+// allowed to run on: the highest-indexed one for the hot thread, the
+// lowest-indexed one for the watcher thread. No particular core is
+// guaranteed to be "faster" on every machine, but *fixed and distinct*
+// is what matters here — it stops the scheduler from migrating the
+// hot thread mid-run, and keeps the two threads from ever landing on
+// the same core and evicting each other's cache lines. Falls back to
+// core 0 for both on a single-core affinity mask, which is harmless.
+static void PinThreads(std::thread& hot, std::thread& watcher) {
+    DWORD_PTR processMask = 0, systemMask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask))
+        return;   // can't determine topology — leave both threads unpinned rather than guess
+
+    int lowCore = -1, highCore = -1;
+    for (int i = 0; i < (int)(sizeof(DWORD_PTR) * 8); ++i) {
+        if (processMask & ((DWORD_PTR)1 << i)) {
+            if (lowCore == -1) lowCore = i;
+            highCore = i;
+        }
+    }
+    if (lowCore == -1) return;   // shouldn't happen, but don't pin to a nonexistent core
+
+    SetThreadAffinityMask(hot.native_handle(), (DWORD_PTR)1 << highCore);
+    SetThreadAffinityMask(watcher.native_handle(), (DWORD_PTR)1 << lowCore);
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Entry point
 // ══════════════════════════════════════════════════════════════
@@ -656,6 +720,9 @@ int main(int argc, char** argv) {
 
     std::thread hot(MacroLoop);
     SetThreadPriority(hot.native_handle(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    PinThreads(hot, watcher);   // fixed, distinct cores — see PinThreads() comment
+
     hot.join();
 
     g_running.store(false);
