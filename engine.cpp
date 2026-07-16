@@ -579,6 +579,46 @@ static void MacroLoop() {
     // one every iteration.
     std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
 
+    // Resume on whichever group was active last time, instead of
+    // always starting at index 0. engine_status.txt is a leftover
+    // from the previous run (this process didn't write it — the last
+    // one did), and the AHK GUI reads that same file on its own
+    // startup to show its "Skill: X" tooltip. Without this, a fresh
+    // engine always silently arms group 0 while the GUI displays
+    // whatever group was active when it was last closed — they only
+    // resync once the user presses the cycle key and forces a real
+    // write. Reading it back here means the first real detection
+    // after launch already matches what the GUI is showing, no extra
+    // cycle-key press needed.
+    if (!g_statusPath.empty()) {
+        HANDLE h = CreateFileA(g_statusPath.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            char buf[64] = {};
+            DWORD readBytes = 0;
+            ReadFile(h, buf, sizeof(buf) - 1, &readBytes, NULL);
+            CloseHandle(h);
+            std::string lastGroup(buf, readBytes);
+            size_t a = lastGroup.find_first_not_of(" \t\r\n");
+            size_t b = lastGroup.find_last_not_of(" \t\r\n");
+            if (a != std::string::npos) {
+                lastGroup = lastGroup.substr(a, b - a + 1);
+                const auto& groups = sp->keyGroups;
+                for (size_t i = 0; i < groups.size(); ++i) {
+                    if (groups[i] == lastGroup) {
+                        currentGroupIndex = (int)i;
+                        break;
+                    }
+                }
+                // No match (group renamed/removed since last run, or
+                // file is garbage) just leaves currentGroupIndex at 0,
+                // same as today's behavior — this only helps the
+                // common case, never makes an edge case worse.
+            }
+        }
+    }
+
     while (g_running.load(std::memory_order_relaxed)) {
         if (g_settingsDirty.exchange(false, std::memory_order_acquire)) {
             sp = std::atomic_load(&g_settings);
