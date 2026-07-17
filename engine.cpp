@@ -16,7 +16,7 @@
 //  Build (see build.yml for the CI version of this):
 //    MSVC:   cl /O2 /EHsc engine.cpp /link /SUBSYSTEM:WINDOWS ^
 //                /ENTRY:mainCRTStartup user32.lib gdi32.lib d3d11.lib dxgi.lib /OUT:engine.exe
-//    MinGW:  g++ -O2 -municode -mwindows engine.cpp -o engine.exe ^
+//    MinGW:  g++ -O2 -mwindows engine.cpp -o engine.exe ^
 //                -luser32 -lgdi32 -ld3d11 -ldxgi
 //
 //  ── Change log ──
@@ -96,7 +96,10 @@ static std::atomic<bool> g_running{true};
 // Settings snapshot. The hot loop only does the (comparatively
 // expensive, cross-thread-contended) shared_ptr reload when this is
 // set, instead of on every single iteration.
-static std::atomic<bool> g_settingsDirty{true};   // true so MacroLoop's first iteration loads it
+// A version counter lets the hot loop perform a read-only atomic load while
+// the configuration is unchanged.  A boolean exchange writes a cache line on
+// every iteration, which is especially expensive with a 1 ms frame wait.
+static std::atomic<unsigned> g_settingsVersion{1};
 
 // ══════════════════════════════════════════════════════════════
 //  Fast pixel read via DXGI Desktop Duplication.
@@ -143,6 +146,9 @@ public:
     // tighten consistency further; on a CPU where that core is also
     // needed by the game itself, competing for it could hurt more than
     // the jitter fix helps. Set back to 15 if that's the case for you.
+    // Lowest-latency mode: poll without a timeout while R is held. On this
+    // machine it has been measured at only ~2% CPU, so avoiding even the
+    // small wake-up jitter of a blocking wait is the preferred trade-off.
     static constexpr UINT kAcquireTimeoutMs = 0;
 
     // Non-blocking beyond kAcquireTimeoutMs. Coordinates are
@@ -245,8 +251,12 @@ private:
         Shutdown();
 
         D3D_FEATURE_LEVEL fl;
+        // PixelReader and every D3D object it owns live exclusively on the
+        // macro thread.  Tell D3D11 that explicitly so it does not add its
+        // otherwise-unneeded internal multithread synchronization to every
+        // capture/copy/map operation.
         HRESULT hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED,
             nullptr, 0, D3D11_SDK_VERSION, &m_device, &fl, &m_context);
         if (FAILED(hr)) return false;
 
@@ -390,12 +400,10 @@ static void SendCharDownUp(char c) {
 // TIME_CRITICAL — would have to wait for that lock. That's a classic
 // priority-inversion stall, and it doesn't need to happen often to
 // show up as an occasional extra frame of input latency.
-static void PressKeyGroup(const char* group, size_t len) {
+static UINT BuildKeyGroupInputs(const char* group, size_t len, INPUT* inputs) {
     constexpr size_t kMaxKeys = 32;
     if (len > kMaxKeys) len = kMaxKeys;
 
-    INPUT downs[kMaxKeys];
-    INPUT ups[kMaxKeys];
     UINT count = 0;
 
     for (size_t i = 0; i < len; ++i) {
@@ -409,17 +417,23 @@ static void PressKeyGroup(const char* group, size_t len) {
         down.ki.wVk = vk;
         down.ki.wScan = scan;
         down.ki.dwFlags = KEYEVENTF_SCANCODE;
-        downs[count] = down;
+        inputs[count] = down;
 
         INPUT up = down;
         up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-        ups[count] = up;
+        inputs[kMaxKeys + count] = up;
 
         ++count;
     }
 
-    if (count) SendInput(count, downs, sizeof(INPUT));
-    if (count) SendInput(count, ups,   sizeof(INPUT));
+    // Keep all presses before all releases, but place them contiguously so a
+    // burst is injected through one SendInput system call rather than two.
+    if (count) memmove(inputs + count, inputs + kMaxKeys, count * sizeof(INPUT));
+    return count;
+}
+
+static void SendPreparedKeyGroup(INPUT* inputs, UINT keyCount) {
+    if (keyCount) SendInput(keyCount * 2, inputs, sizeof(INPUT));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -499,10 +513,9 @@ static void LoadConfig() {
     s->cycleKeyName = buf;
 
     std::atomic_store(&g_settings, std::shared_ptr<const Settings>(s));
-    // Tell the hot loop a new snapshot is waiting. release ordering
-    // pairs with the acquire exchange in MacroLoop, so the loop never
-    // sees this flag before it can also see the finished atomic_store above.
-    g_settingsDirty.store(true, std::memory_order_release);
+    // Published after the new snapshot.  The hot loop reloads only when this
+    // value changes, with no atomic writes on its ordinary polling path.
+    g_settingsVersion.fetch_add(1, std::memory_order_release);
 }
 
 // Also now the only place that writes engine_status.txt: instead of a
@@ -558,10 +571,11 @@ enum class MacroState { IDLE, BURST, COOLDOWN };
 static void MacroLoop() {
     MacroState state = MacroState::IDLE;
     int burstCount = 0;
-    // Fixed buffer, not std::string: latching the group name at BURST
-    // start must not allocate (see PressKeyGroup's comment above).
-    char burstGroup[32] = {};
-    size_t burstGroupLen = 0;
+    // Prepared once when a burst starts; every later repetition simply calls
+    // SendInput. This avoids key-name parsing and MapVirtualKey in the burst
+    // path, and sends down/up events in one syscall.
+    INPUT burstInputs[64] = {};
+    UINT burstInputCount = 0;
     ULONGLONG cooldownEndMs = 0;
     int currentGroupIndex = 0;
 
@@ -578,6 +592,7 @@ static void MacroLoop() {
     // the only shared_ptr touch on the whole hot path now instead of
     // one every iteration.
     std::shared_ptr<const Settings> sp = std::atomic_load(&g_settings);
+    unsigned seenSettingsVersion = 0;
 
     // Resume on whichever group was active last time, instead of
     // always starting at index 0. engine_status.txt is a leftover
@@ -620,17 +635,18 @@ static void MacroLoop() {
     }
 
     while (g_running.load(std::memory_order_relaxed)) {
-        if (g_settingsDirty.exchange(false, std::memory_order_acquire)) {
+        unsigned settingsVersion = g_settingsVersion.load(std::memory_order_acquire);
+        if (settingsVersion != seenSettingsVersion) {
             sp = std::atomic_load(&g_settings);
+            seenSettingsVersion = settingsVersion;
         }
         const Settings& s = *sp;
 
         bool activeThisIteration = false;
-        // Set whenever this iteration already blocked inside
-        // AcquireNextFrame (kAcquireTimeoutMs). That wait already
-        // paces the loop, so the Sleep(1) below would only add
-        // needless extra latency on top of it — skip it in that case.
-        bool didBlockingPixelRead = false;
+        // Set whenever R caused a pixel poll. With a blocking timeout, DXGI
+        // already paces the loop; with the zero timeout used here, skipping
+        // Sleep(1) deliberately keeps the next poll as close as possible.
+        bool didPixelPoll = false;
 
         if (s.cycleKeyName != prevCycleKeyName) {
             prevCycleKeyName = s.cycleKeyName;
@@ -667,25 +683,31 @@ static void MacroLoop() {
                             // work; point it at any spot and the engine
                             // watches for that spot turning white.
                             //
-                            // This call blocks for up to
-                            // PixelReader::kAcquireTimeoutMs waiting on
-                            // the compositor's own frame-ready signal —
-                            // that block IS this iteration's pacing.
+                            // In zero-timeout mode this is a non-blocking
+                            // poll, intentionally repeated with no Sleep
+                            // while R remains held.
                             DWORD rgb = pixelReader.GetPixelRGB(s.px, s.py);
-                            didBlockingPixelRead = true;
+                            didPixelPoll = true;
                             if (rgb == 0xFFFFFFu) {
                                 const std::string& g = s.keyGroups[currentGroupIndex];
-                                burstGroupLen = g.size() < sizeof(burstGroup) - 1
-                                                    ? g.size() : sizeof(burstGroup) - 1;
-                                memcpy(burstGroup, g.data(), burstGroupLen);
-                                burstCount = 0;
-                                state = MacroState::BURST;
+                                burstInputCount = BuildKeyGroupInputs(g.data(), g.size(), burstInputs);
+                                // Send burst #1 now, rather than waiting for
+                                // the next state-machine iteration.
+                                SendPreparedKeyGroup(burstInputs, burstInputCount);
+                                burstCount = 1;
+                                activeThisIteration = true;
+                                if (burstCount >= s.burstSize) {
+                                    state = MacroState::COOLDOWN;
+                                    cooldownEndMs = now + (ULONGLONG)(s.cooldownSeconds * 1000.0);
+                                } else {
+                                    state = MacroState::BURST;
+                                }
                             }
                         }
                         break;
 
                     case MacroState::BURST:
-                        PressKeyGroup(burstGroup, burstGroupLen);
+                        SendPreparedKeyGroup(burstInputs, burstInputCount);
                         burstCount++;
                         activeThisIteration = true;
                         if (burstCount >= s.burstSize) {
@@ -700,11 +722,10 @@ static void MacroLoop() {
 #if BUSY_SPIN
 #else
         // Only sleep when nothing already paced this iteration for us:
-        // not mid-burst, and not an IDLE poll that just blocked inside
-        // AcquireNextFrame. Everything else (suspended, cooldown,
+        // not mid-burst, and not an IDLE pixel poll. Everything else (suspended, cooldown,
         // R not held, no key groups configured) still needs this so
         // the loop doesn't spin the core at 100%.
-        if (!activeThisIteration && !didBlockingPixelRead) Sleep(1);
+        if (!activeThisIteration && !didPixelPoll) Sleep(1);
 #endif
     }
     // pixelReader's destructor releases the D3D11 device/duplication/texture.
@@ -718,6 +739,15 @@ static void MacroLoop() {
 // hot thread mid-run, and keeps the two threads from ever landing on
 // the same core and evicting each other's cache lines. Falls back to
 // core 0 for both on a single-core affinity mask, which is harmless.
+static HANDLE NativeThreadHandle(std::thread& thread) {
+#ifdef _MSC_VER
+    return thread.native_handle();
+#else
+    // MinGW exposes std::thread's native handle as an integer handle.
+    return reinterpret_cast<HANDLE>(thread.native_handle());
+#endif
+}
+
 static void PinThreads(std::thread& hot, std::thread& watcher) {
     DWORD_PTR processMask = 0, systemMask = 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask))
@@ -732,8 +762,8 @@ static void PinThreads(std::thread& hot, std::thread& watcher) {
     }
     if (lowCore == -1) return;   // shouldn't happen, but don't pin to a nonexistent core
 
-    SetThreadAffinityMask(hot.native_handle(), (DWORD_PTR)1 << highCore);
-    SetThreadAffinityMask(watcher.native_handle(), (DWORD_PTR)1 << lowCore);
+    SetThreadAffinityMask(NativeThreadHandle(hot), (DWORD_PTR)1 << highCore);
+    SetThreadAffinityMask(NativeThreadHandle(watcher), (DWORD_PTR)1 << lowCore);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -772,7 +802,7 @@ int main(int argc, char** argv) {
     std::thread watcher(ConfigWatcherThread, mainPID);
 
     std::thread hot(MacroLoop);
-    SetThreadPriority(hot.native_handle(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(NativeThreadHandle(hot), THREAD_PRIORITY_TIME_CRITICAL);
 
     PinThreads(hot, watcher);   // fixed, distinct cores — see PinThreads() comment
 
