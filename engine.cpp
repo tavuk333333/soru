@@ -713,7 +713,9 @@ static void MacroLoop() {
                         if (burstCount >= s.burstSize) {
                             state = MacroState::COOLDOWN;
                             cooldownEndMs = now + (ULONGLONG)(s.cooldownSeconds * 1000.0);
-                        }
+                        } else {
+                            Sleep(1);
+                            }
                         break;
                 }
             }
